@@ -2,98 +2,143 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <dirent.h>
-#include <sys/stat.h>
+#include <arpa/inet.h>
 
-#define PORT 5050
+#define PORTA 5050
 #define BUFFER_SIZE 8192
-#define DIR_PATH "./site"  // Diretório a servir
+#define SITE_DIR "./site"  // pasta a servir
 
-// Envia resposta HTTP simples
-void send_response(int client_sock, const char *status, const char *content_type, const char *body) {
-    char response[BUFFER_SIZE];
-    snprintf(response, sizeof(response), "HTTP/1.0 %s\r\nContent-Type: %s\r\n\r\n%s", status, content_type, body);
-    send(client_sock, response, strlen(response), 0);
+// Envia resposta simples
+void enviar_resposta(int cliente, const char *tipo_conteudo, const char *conteudo) {
+    char cabecalho[256];
+    snprintf(cabecalho, sizeof(cabecalho),
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Type: %s\r\n"
+             "Connection: close\r\n\r\n", tipo_conteudo);
+    send(cliente, cabecalho, strlen(cabecalho), 0);
+    send(cliente, conteudo, strlen(conteudo), 0);
 }
 
-// Servir arquivo solicitado
-void serve_file(int client_sock, const char *filepath) {
-    FILE *file = fopen(filepath, "rb");
-    if (!file) {
-        // Arquivo não encontrado: listar arquivos em texto puro
-        DIR *dir = opendir(DIR_PATH);
-        char body[BUFFER_SIZE] = "Arquivo não encontrado.\nArquivos disponíveis:\n";
-        if (dir) {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != NULL) {
-                if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
-                    strncat(body, entry->d_name, sizeof(body) - strlen(body) - 2);
-                    strncat(body, "\n", sizeof(body) - strlen(body) - 1);
-                }
-            }
-            closedir(dir);
-        }
-        send_response(client_sock, "404 Not Found", "text/plain", body);
+// Envia arquivo solicitado
+void enviar_arquivo(int cliente, const char *arquivo) {
+    char caminho[512];
+    snprintf(caminho, sizeof(caminho), "%s/%s", SITE_DIR, arquivo);
+
+    printf("Tentando abrir arquivo: %s\n", caminho); // debug
+
+    FILE *fp = fopen(caminho, "rb");
+    if (!fp) {
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "HTTP/1.1 404 Not Found\r\n"
+                 "Content-Type: text/plain\r\n"
+                 "Connection: close\r\n\r\n"
+                 "Erro 404: Arquivo '%s' nao encontrado.\n",
+                 arquivo, SITE_DIR);
+        send(cliente, msg, strlen(msg), 0);
         return;
     }
 
-    // Arquivo encontrado: enviar conteúdo
-    char header[256];
-    snprintf(header, sizeof(header), "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n");
-    send(client_sock, header, strlen(header), 0);
+    // Detecta tipo de conteúdo
+    const char *tipo = "application/octet-stream";
+    const char *ext = strrchr(arquivo, '.');
+    if (ext) {
+        if (strcmp(ext, ".html") == 0) tipo = "text/html";
+        else if (strcmp(ext, ".txt") == 0) tipo = "text/plain";
+        else if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0) tipo = "image/jpeg";
+        else if (strcmp(ext, ".png") == 0) tipo = "image/png";
+        else if (strcmp(ext, ".gif") == 0) tipo = "image/gif";
+    }
+
+    char cabecalho[256];
+    snprintf(cabecalho, sizeof(cabecalho),
+             "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: close\r\n\r\n", tipo);
+    send(cliente, cabecalho, strlen(cabecalho), 0);
 
     char buffer[BUFFER_SIZE];
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
-        send(client_sock, buffer, bytes_read, 0);
+    size_t lido;
+    while ((lido = fread(buffer, 1, sizeof(buffer), fp)) > 0)
+        send(cliente, buffer, lido, 0);
+
+    fclose(fp);
+}
+
+
+// Envia lista de arquivos em HTML
+void enviar_lista(int cliente) {
+    DIR *dir = opendir(SITE_DIR);
+    if (!dir) {
+        enviar_resposta(cliente, "text/plain", "Erro ao abrir diretório site/.\n");
+        return;
     }
-    fclose(file);
+
+    char conteudo[8192];
+    strcpy(conteudo,
+           "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Servidor HTTP</title>"
+           "<style>body{font-family:sans-serif;padding:20px} a{display:block;margin:5px;}</style></head>"
+           "<body><h1>Arquivos disponiveis</h1>");
+
+    struct dirent *entrada;
+    while ((entrada = readdir(dir)) != NULL) {
+        if (entrada->d_type == DT_REG) {  // apenas arquivos
+            char linha[256];
+            snprintf(linha, sizeof(linha), "<a href=\"/%s\">%s</a>", entrada->d_name, entrada->d_name);
+            strcat(conteudo, linha);
+        }
+    }
+    closedir(dir);
+    strcat(conteudo, "</body></html>");
+    enviar_resposta(cliente, "text/html", conteudo);
 }
 
 int main() {
-    int server_sock, client_sock;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    int servidor, cliente;
+    struct sockaddr_in addr_servidor, addr_cliente;
+    socklen_t tamanho_cliente;
+    char buffer[BUFFER_SIZE];
 
-    server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) { perror("Erro ao criar socket"); return 1; }
+    servidor = socket(AF_INET, SOCK_STREAM, 0);
+    if (servidor < 0) { perror("Erro socket"); return 1; }
 
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    addr_servidor.sin_family = AF_INET;
+    addr_servidor.sin_addr.s_addr = INADDR_ANY;
+    addr_servidor.sin_port = htons(PORTA);
 
-    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Erro no bind"); close(server_sock); return 1;
+    if (bind(servidor, (struct sockaddr *)&addr_servidor, sizeof(addr_servidor)) < 0) {
+        perror("Erro bind"); close(servidor); return 1;
     }
 
-    listen(server_sock, 5);
-    printf("Servidor rodando na porta %d, servindo diretório: %s\n", PORT, DIR_PATH);
+    listen(servidor, 5);
+    printf("Servidor rodando em http://localhost:%d (servindo pasta site/)\n", PORTA);
 
     while (1) {
-        client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
-        if (client_sock < 0) { perror("Erro no accept"); continue; }
+        tamanho_cliente = sizeof(addr_cliente);
+        cliente = accept(servidor, (struct sockaddr *)&addr_cliente, &tamanho_cliente);
+        if (cliente < 0) { perror("Erro accept"); continue; }
 
-        char buffer[BUFFER_SIZE];
-        int bytes_received = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received > 0) {
-            buffer[bytes_received] = '\0';
-            char method[16], path[256];
+        int bytes = recv(cliente, buffer, sizeof(buffer)-1, 0);
+        if (bytes > 0) {
+            buffer[bytes] = '\0';
+            char metodo[8], caminho[256];
+            sscanf(buffer, "%s %s", metodo, caminho);
 
-            if (sscanf(buffer, "%15s %255s", method, path) == 2 && strcmp(method, "GET") == 0) {
-                char filepath[512];
-                snprintf(filepath, sizeof(filepath), "%s%s", DIR_PATH, path);
-                serve_file(client_sock, filepath);
-            } else {
-                send_response(client_sock, "400 Bad Request", "text/plain", "Requisição inválida\n");
+            printf("Requisição recebida: %s\n", caminho); // debug
+
+            if (strcmp(caminho, "/") == 0)
+                enviar_lista(cliente);
+            else {
+                char arquivo[512];
+                snprintf(arquivo, sizeof(arquivo), "%s", caminho + (caminho[0]=='/'?1:0));
+                enviar_arquivo(cliente, arquivo);
             }
         }
 
-        close(client_sock);
+        close(cliente);
     }
 
-    close(server_sock);
+    close(servidor);
     return 0;
 }
