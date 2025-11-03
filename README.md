@@ -22,7 +22,7 @@ make
 ./servidor site
 
 ### Rodar Cliente
-./cliente http://localhost:5050/index.html
+./cliente http://localhost:5050/
 ./cliente http://localhost:5050/imagem.jpg
 ./cliente http://localhost:5050/arquivo.pdf
 
