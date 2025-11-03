@@ -5,103 +5,121 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
-#include <arpa/inet.h>
 
 #define BUFFER_SIZE 8192
 
+// Função para mostrar lista de arquivos do HTML recebido
+void mostrar_lista_html(const char *html) {
+    const char *ptr = html;
+    printf("Arquivos disponíveis:\n");
+    while ((ptr = strstr(ptr, "<a href=\"")) != NULL) {
+        ptr += 9; // pula <a href="
+        const char *end = strchr(ptr, '"');
+        if (!end) break;
+        char arquivo[256];
+        strncpy(arquivo, ptr, end - ptr);
+        arquivo[end - ptr] = '\0';
+        printf(" - %s\n", arquivo);
+        ptr = end;
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 2) {
-        fprintf(stderr, "Uso: %s <URL>\nExemplo: %s http://localhost:5050/arquivo.txt\n", argv[0], argv[0]);
+        fprintf(stderr, "Uso: %s <URL>\nExemplo: %s http://localhost:5050/\n", argv[0], argv[0]);
         return 1;
     }
 
     char *url = argv[1];
-    char host[256], path[256];
-    int port = 80;
+    char host[256] = "";
+    char path[512] = "";
+    int port = 5050;
 
-    // Parse da URL
-    if (sscanf(url, "http://%255[^:/]:%d/%255[^\n]", host, &port, path) < 2) {
-        if (sscanf(url, "http://%255[^/]/%255[^\n]", host, path) < 1) {
-            fprintf(stderr, "URL inválida\n");
-            return 1;
-        }
+    if (strncmp(url, "http://", 7) == 0) url += 7;
+
+    if (sscanf(url, "%255[^:/]:%d/%511[^\n]", host, &port, path) != 3) {
+        if (sscanf(url, "%255[^:/]/%511[^\n]", host, path) != 2) strcpy(path, "");
+        else if (sscanf(url, "%255[^:/]", host) != 1) { fprintf(stderr,"URL inválida\n"); return 1; }
     }
 
-    // Resolver host
+    if (strlen(path) == 0) strcpy(path, "/");
+
     struct hostent *server = gethostbyname(host);
-    if (!server) {
-        fprintf(stderr, "Erro ao resolver host\n");
-        return 1;
-    }
+    if (!server) { fprintf(stderr,"Host não encontrado: %s\n", host); return 1; }
 
-    // Criar socket
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) { perror("Erro ao criar socket"); return 1; }
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) { perror("Erro socket"); return 1; }
 
     struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
     memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
 
-    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("Erro ao conectar");
-        close(sockfd);
-        return 1;
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        perror("Erro conectar"); close(sock); return 1;
     }
 
-    // Construir requisição HTTP segura
-    char request[512];
-    snprintf(request, sizeof(request), "GET /%s HTTP/1.0\r\nHost: %s\r\n\r\n", path, host);
+    char request[1024];
+    snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n",
+             (path[0]=='/')?path:path, host);
 
-    if (send(sockfd, request, strlen(request), 0) < 0) {
-        perror("Erro ao enviar requisição");
-        close(sockfd);
-        return 1;
-    }
+    send(sock, request, strlen(request), 0);
 
     char buffer[BUFFER_SIZE];
-    int bytes_received;
+    int bytes;
     int header_done = 0;
-    char status_line[256];
-    char filename[256];
-    strcpy(filename, strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
     FILE *file = NULL;
+    char filename[256];
+    char *html_buffer = NULL;
+    size_t html_size = 0;
 
-    while ((bytes_received = recv(sockfd, buffer, BUFFER_SIZE - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0';
+    if (strcmp(path, "/") != 0) {
+        const char *slash = strrchr(path, '/');
+        strcpy(filename, (slash && *(slash+1)) ? slash+1 : path);
+    }
+
+    while ((bytes = recv(sock, buffer, sizeof(buffer)-1, 0)) > 0) {
+        buffer[bytes] = '\0';
 
         if (!header_done) {
-            char *body_start = strstr(buffer, "\r\n\r\n");
-            if (body_start) {
-                header_done = 1;
-                sscanf(buffer, "%255[^\r\n]", status_line);
+            char *body = strstr(buffer, "\r\n\r\n");
+            if (!body) continue;
+            header_done = 1;
+            body += 4;
 
-                if (strstr(status_line, "200 OK")) {
-                    // Só criar arquivo se status for 200
-                    file = fopen(filename, "wb");
-                    if (!file) { perror("Erro ao abrir arquivo"); close(sockfd); return 1; }
-                    fwrite(body_start + 4, 1, bytes_received - (body_start - buffer + 4), file);
-                } else {
-                    // Arquivo não encontrado: imprimir mensagem/texto do servidor
-                    printf("%s", body_start + 4);
-                    file = NULL;
-                }
+            // Analisa status HTTP
+            char status[64];
+            sscanf(buffer, "%63s %63[^\r\n]", status, status+4);
+
+            if (strstr(status, "404 Not Found")) {
+                printf("%s\n", body);
+                close(sock);
+                return 1;
+            }
+
+            if (strcmp(path,"/")==0) {
+                html_buffer = malloc(bytes + 1);
+                strcpy(html_buffer, body);
+                html_size = bytes - (body-buffer);
+            } else {
+                file = fopen(filename,"wb");
+                if (!file){ perror("Erro criar arquivo"); close(sock); return 1;}
+                fwrite(body, 1, bytes - (body-buffer), file);
             }
         } else {
-            if (file) {
-                fwrite(buffer, 1, bytes_received, file);
-            } else {
-                printf("%s", buffer);
+            if (file) fwrite(buffer,1,bytes,file);
+            else if (strcmp(path,"/")==0) {
+                html_buffer = realloc(html_buffer, html_size + bytes + 1);
+                memcpy(html_buffer + html_size, buffer, bytes);
+                html_size += bytes;
+                html_buffer[html_size] = '\0';
             }
         }
     }
 
-    if (file) {
-        fclose(file);
-        printf("Arquivo salvo como: %s\n", filename);
-    }
+    if(file) { fclose(file); printf("Arquivo salvo: %s\n", filename); }
+    else if(html_buffer) { mostrar_lista_html(html_buffer); free(html_buffer); }
 
-    close(sockfd);
+    close(sock);
     return 0;
 }
